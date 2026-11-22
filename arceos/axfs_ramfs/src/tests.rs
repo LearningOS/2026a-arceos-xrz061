@@ -134,3 +134,61 @@ fn test_ramfs() {
     assert_eq!(root.remove("./foo"), Ok(()));
     assert!(ramfs.root_dir_node().get_entries().is_empty());
 }
+
+#[test]
+fn rename_preserves_contents_and_open_nodes() {
+    let fs = RamFileSystem::new();
+    let root = fs.root_dir();
+    root.create("old", VfsNodeType::File).unwrap();
+    let open = root.clone().lookup("old").unwrap();
+    open.write_at(0, b"hello").unwrap();
+    root.rename("old", "new").unwrap();
+    assert_eq!(root.clone().lookup("old").err(), Some(VfsError::NotFound));
+    let renamed = root.lookup("new").unwrap();
+    assert!(Arc::ptr_eq(&open, &renamed));
+    let mut data = [0; 5];
+    assert_eq!(renamed.read_at(0, &mut data).unwrap(), 5);
+    assert_eq!(&data, b"hello");
+}
+
+#[test]
+fn rename_checks_source_before_replacing_target() {
+    let fs = RamFileSystem::new();
+    let root = fs.root_dir();
+    root.create("target", VfsNodeType::File).unwrap();
+    let target = root.clone().lookup("target").unwrap();
+    assert_eq!(root.rename("missing", "target"), Err(VfsError::NotFound));
+    assert!(Arc::ptr_eq(
+        &target,
+        &root.clone().lookup("target").unwrap()
+    ));
+    root.rename("target", "target").unwrap();
+    root.create("source", VfsNodeType::File).unwrap();
+    let source = root.clone().lookup("source").unwrap();
+    root.rename("source", "target").unwrap();
+    assert!(Arc::ptr_eq(&source, &root.lookup("target").unwrap()));
+}
+
+#[test]
+fn rename_in_subdirectory_rejects_moves_and_type_changes() {
+    let fs = RamFileSystem::new();
+    let root = fs.root_dir();
+    root.create("dir", VfsNodeType::Dir).unwrap();
+    root.create("dir/file", VfsNodeType::File).unwrap();
+    root.rename("dir/file", "dir/renamed").unwrap();
+    assert!(root.clone().lookup("dir/renamed").is_ok());
+    assert_eq!(
+        root.rename("dir/renamed", "moved"),
+        Err(VfsError::Unsupported)
+    );
+    root.create("file", VfsNodeType::File).unwrap();
+    assert_eq!(root.rename("file", "dir"), Err(VfsError::IsADirectory));
+    assert_eq!(root.rename("dir", "file"), Err(VfsError::NotADirectory));
+    root.create("empty", VfsNodeType::Dir).unwrap();
+    assert_eq!(
+        root.rename("empty", "dir"),
+        Err(VfsError::DirectoryNotEmpty)
+    );
+    assert!(root.clone().lookup("empty").is_ok());
+    assert!(root.lookup("dir/renamed").is_ok());
+}

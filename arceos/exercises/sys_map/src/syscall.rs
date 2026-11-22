@@ -1,13 +1,13 @@
 #![allow(dead_code)]
 
-use core::ffi::{c_void, c_char, c_int};
-use axhal::arch::TrapFrame;
-use axhal::trap::{register_trap_handler, SYSCALL};
+use arceos_posix_api as api;
 use axerrno::LinuxError;
+use axhal::arch::TrapFrame;
+use axhal::paging::MappingFlags;
+use axhal::trap::{register_trap_handler, SYSCALL};
 use axtask::current;
 use axtask::TaskExtRef;
-use axhal::paging::MappingFlags;
-use arceos_posix_api as api;
+use core::ffi::{c_char, c_int, c_void};
 
 const SYS_IOCTL: usize = 29;
 const SYS_OPENAT: usize = 56;
@@ -100,9 +100,14 @@ bitflags::bitflags! {
 fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     ax_println!("handle_syscall [{}] ...", syscall_num);
     let ret = match syscall_num {
-         SYS_IOCTL => sys_ioctl(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _) as _,
+        SYS_IOCTL => sys_ioctl(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _) as _,
         SYS_SET_TID_ADDRESS => sys_set_tid_address(tf.arg0() as _),
-        SYS_OPENAT => sys_openat(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _, tf.arg3() as _),
+        SYS_OPENAT => sys_openat(
+            tf.arg0() as _,
+            tf.arg1() as _,
+            tf.arg2() as _,
+            tf.arg3() as _,
+        ),
         SYS_CLOSE => sys_close(tf.arg0() as _),
         SYS_READ => sys_read(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _),
         SYS_WRITE => sys_write(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _),
@@ -110,11 +115,11 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         SYS_EXIT_GROUP => {
             ax_println!("[SYS_EXIT_GROUP]: system is exiting ..");
             axtask::exit(tf.arg0() as _)
-        },
+        }
         SYS_EXIT => {
             ax_println!("[SYS_EXIT]: system is exiting ..");
             axtask::exit(tf.arg0() as _)
-        },
+        }
         SYS_MMAP => sys_mmap(
             tf.arg0() as _,
             tf.arg1() as _,
@@ -131,16 +136,81 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     ret
 }
 
-#[allow(unused_variables)]
 fn sys_mmap(
     addr: *mut usize,
     length: usize,
     prot: i32,
     flags: i32,
     fd: i32,
-    _offset: isize,
+    offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    use memory_addr::{VirtAddr, VirtAddrRange, PAGE_SIZE_4K};
+
+    syscall_body!(sys_mmap, {
+        let prot = MmapProt::from_bits(prot).ok_or(LinuxError::EINVAL)?;
+        let flags = MmapFlags::from_bits(flags).ok_or(LinuxError::EINVAL)?;
+        if length == 0 || offset < 0 || offset as usize % PAGE_SIZE_4K != 0 {
+            return Err(LinuxError::EINVAL);
+        }
+        if !flags.intersects(MmapFlags::MAP_PRIVATE | MmapFlags::MAP_SHARED)
+            || flags.contains(MmapFlags::MAP_PRIVATE | MmapFlags::MAP_SHARED)
+        {
+            return Err(LinuxError::EINVAL);
+        }
+        // This eager mapping implements private snapshots. Shared writeback and
+        // replacement of existing fixed mappings require a different backend.
+        if flags.intersects(MmapFlags::MAP_SHARED | MmapFlags::MAP_FIXED) {
+            return Err(LinuxError::ENOSYS);
+        }
+        let size = length
+            .checked_add(PAGE_SIZE_4K - 1)
+            .map(|size| size & !(PAGE_SIZE_4K - 1))
+            .ok_or(LinuxError::ENOMEM)?;
+        (offset as usize)
+            .checked_add(length)
+            .ok_or(LinuxError::EOVERFLOW)?;
+
+        let curr = current();
+        let mut aspace = curr.task_ext().aspace.lock();
+        if size > aspace.size() {
+            return Err(LinuxError::ENOMEM);
+        }
+        let limit = VirtAddrRange::from_start_size(aspace.base(), aspace.size());
+        let hint = if addr.is_null() {
+            0x1000_0000
+        } else {
+            addr as usize
+        };
+        let hint = VirtAddr::from(hint & !(PAGE_SIZE_4K - 1));
+        let start = aspace
+            .find_free_area(hint, size, limit)
+            .or_else(|| aspace.find_free_area(PAGE_SIZE_4K.into(), size, limit))
+            .ok_or(LinuxError::ENOMEM)?;
+
+        // Read by offset so mmap does not change the open file's seek position.
+        // Validate and read before installing the mapping to avoid partial maps
+        // when an invalid descriptor or a read error is encountered.
+        let mut data = alloc::vec::Vec::new();
+        if !flags.contains(MmapFlags::MAP_ANONYMOUS) {
+            let file = api::get_file_like(fd)?;
+            data.try_reserve_exact(length)
+                .map_err(|_| LinuxError::ENOMEM)?;
+            data.resize(length, 0);
+            let mut done = 0;
+            while done < length {
+                let n = file.read_at((offset as usize + done) as u64, &mut data[done..])?;
+                if n == 0 {
+                    break;
+                }
+                done += n;
+            }
+        }
+        aspace.map_alloc(start, size, prot.into(), true)?;
+        if !data.is_empty() {
+            aspace.write(start, &data)?;
+        }
+        Ok(start.as_usize())
+    })
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {

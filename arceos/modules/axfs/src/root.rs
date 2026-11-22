@@ -87,7 +87,13 @@ impl RootDirectory {
         // TODO: more efficient, e.g. trie
         for (i, mp) in self.mounts.iter().enumerate() {
             // skip the first '/'
-            if path.starts_with(&mp.path[1..]) && mp.path.len() - 1 > max_len {
+            let mount_path = &mp.path[1..];
+            if (path == mount_path
+                || path
+                    .strip_prefix(mount_path)
+                    .is_some_and(|rest| rest.starts_with('/')))
+                && mount_path.len() > max_len
+            {
                 max_len = mp.path.len() - 1;
                 idx = i;
             }
@@ -134,11 +140,15 @@ impl VfsNodeOps for RootDirectory {
 
     fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
         self.lookup_mounted_fs(src_path, |fs, rest_path| {
-            if rest_path.is_empty() {
-                ax_err!(PermissionDenied) // cannot rename mount points
-            } else {
-                fs.root_dir().rename(rest_path, dst_path)
-            }
+            self.lookup_mounted_fs(dst_path, |dst_fs, dst_rest| {
+                if rest_path.trim_matches('/').is_empty() || dst_rest.trim_matches('/').is_empty() {
+                    ax_err!(PermissionDenied)
+                } else if !Arc::ptr_eq(&fs, &dst_fs) {
+                    ax_err!(Unsupported)
+                } else {
+                    fs.root_dir().rename(rest_path, dst_rest)
+                }
+            })
         })
     }
 }
@@ -302,9 +312,7 @@ pub(crate) fn set_current_dir(path: &str) -> AxResult {
 }
 
 pub(crate) fn rename(old: &str, new: &str) -> AxResult {
-    if parent_node_of(None, new).lookup(new).is_ok() {
-        warn!("dst file already exist, now remove it");
-        remove_file(None, new)?;
-    }
-    parent_node_of(None, old).rename(old, new)
+    let old = absolute_path(old)?;
+    let new = absolute_path(new)?;
+    ROOT_DIR.rename(&old, &new)
 }
